@@ -1,0 +1,35 @@
+name: Build ConePressor
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCOPY_AFTER_BUILD=OFF
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Zip (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent build/ConePressor_artefacts ConePressor-macOS.zip
+
+      - name: Zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path build/ConePressor_artefacts/* -DestinationPath ConePressor-Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConePressor-${{ runner.os }}
+          path: ConePressor-*.zip
