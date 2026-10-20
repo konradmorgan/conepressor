@@ -1,6 +1,9 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <atomic>
+#include <array>
+#include <map>
+#include "Compressors.h"
 
 class ConePressorProcessor : public juce::AudioProcessor
 {
@@ -33,13 +36,27 @@ public:
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
+    // Undo/Redo (20 Schritte) und A/B-Vergleich
+    using Snapshot = std::map<juce::String, float>;
+    void switchToSlot (int slot);          // 0 = A, 1 = B
+    void copyActiveToOther();              // aktive Einstellung in den anderen Slot kopieren
+    int  getActiveSlot() const { return activeSlot.load(); }
+
+    juce::UndoManager undoManager { 1, 20 };   // vor apvts deklarieren!
     juce::AudioProcessorValueTreeState apvts;
-    std::atomic<float> grMeterDb { 0.0f };   // aktuelle Gain Reduction in dB (positiv)
+    std::atomic<float> grLaDb { 0.0f };   // Gain Reduction LA-2A-Modul (dB)
+    std::atomic<float> grFcDb { 0.0f };   // Gain Reduction 670-Modul (dB)
 
 private:
-    double sr = 44100.0;
-    float grState  = 0.0f;   // geglättete Gain Reduction (dB)
-    float grMemory = 0.0f;   // langsames Gedächtnis für programmabhängige Release-Zeit
+    Snapshot captureSnapshot() const;
+    void applySnapshot (const Snapshot&);
+
+    std::array<Snapshot, 2> slots;
+    std::atomic<int> activeSlot { 0 };
+    juce::CriticalSection slotLock;
+
+    cp::OptoComp  la;
+    cp::VarMuComp fc;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ConePressorProcessor)
 };

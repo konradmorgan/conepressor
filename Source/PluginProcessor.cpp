@@ -1,103 +1,59 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
-#include <cmath>
-
-namespace
-{
-    inline float dbToLin (float db) { return std::pow (10.0f, db * 0.05f); }
-
-    // Soft-Knee Gain Computer (Standard-Formel), liefert Gain Reduction in dB (>= 0)
-    float softKneeGR (float levelDb, float threshDb, float ratio, float kneeDb)
-    {
-        const float over = levelDb - threshDb;
-        const float slope = 1.0f - 1.0f / ratio;
-        if (2.0f * over < -kneeDb) return 0.0f;
-        if (2.0f * std::abs (over) <= kneeDb)
-        {
-            const float t = over + kneeDb * 0.5f;
-            return slope * t * t / (2.0f * kneeDb);
-        }
-        return slope * over;
-    }
-
-    // Variable-Mu-Charakteristik (Fairchild-Stil): Ratio steigt mit dem Pegel über der Schwelle
-    float fairchildGR (float levelDb, float threshDb)
-    {
-        const float over = levelDb - threshDb;
-        if (over <= 0.0f) return 0.0f;
-        const float rMax = 8.0f;
-        const float w = 15.0f;
-        return (1.0f - 1.0f / rMax) * over * over / (over + w);
-    }
-
-    // Weiche Röhren-Sättigung mit leichtem Bias (gerade Harmonische), Kleinsignalverstärkung ~ 1
-    inline float saturate (float x, float amt)
-    {
-        if (amt <= 0.0f) return x;
-        const float drive = 1.0f + 3.0f * amt;
-        const float bias  = 0.08f * amt;
-        return (std::tanh (drive * x + bias) - std::tanh (bias)) / drive;
-    }
-}
 
 ConePressorProcessor::ConePressorProcessor()
     : AudioProcessor (BusesProperties()
                         .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                         .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-      apvts (*this, nullptr, "STATE", createLayout())
+      apvts (*this, &undoManager, "STATE", createLayout())
 {
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout ConePressorProcessor::createLayout()
 {
     using Attr = juce::AudioParameterFloatAttributes;
+    using NR   = juce::NormalisableRange<float>;
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
+    auto addFloat = [&layout] (const char* id, const char* name, NR range, float def, const char* unit)
+    {
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            juce::ParameterID { id, 1 }, name, range, def, Attr().withLabel (unit)));
+    };
+    auto addBool = [&layout] (const char* id, const char* name, bool def)
+    {
+        layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { id, 1 }, name, def));
+    };
+
+    // Global
+    addFloat ("in",   "Input",  NR (-24.0f, 24.0f, 0.1f), 0.0f,   "dB");
+    addFloat ("out",  "Output", NR (-24.0f, 24.0f, 0.1f), 0.0f,   "dB");
+    addFloat ("mix",  "Mix",    NR (0.0f, 100.0f, 1.0f),  100.0f, "%");
+    addFloat ("tube", "Tube",   NR (0.0f, 100.0f, 1.0f),  20.0f,  "%");
+    addBool  ("order", "Order 670 first", false);
+
+    // LA-2A-Modul
+    addBool  ("laOn",    "LA-2A On",      true);
+    addFloat ("laPeak",  "Peak Reduction", NR (0.0f, 100.0f, 0.1f), 30.0f, "");
+    addFloat ("laGain",  "LA-2A Gain",     NR (0.0f, 24.0f, 0.1f),  0.0f,  "dB");
+    addBool  ("laLimit", "Limit",          false);
+
+    // 670-Modul
+    addBool  ("fcOn",     "670 On",         true);
+    addFloat ("fcIn",     "670 Input",      NR (-12.0f, 24.0f, 0.1f), 0.0f,   "dB");
+    addFloat ("fcThresh", "670 Threshold",  NR (-40.0f, 0.0f, 0.1f),  -16.0f, "dB");
     layout.add (std::make_unique<juce::AudioParameterChoice> (
-        juce::ParameterID { "mode", 1 }, "Mode",
-        juce::StringArray { "LA-2A", "Fairchild 670" }, 0));
-
-    layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { "in", 1 }, "Input",
-        juce::NormalisableRange<float> (-24.0f, 24.0f, 0.1f), 0.0f, Attr().withLabel ("dB")));
-
-    layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { "out", 1 }, "Output",
-        juce::NormalisableRange<float> (-24.0f, 24.0f, 0.1f), 0.0f, Attr().withLabel ("dB")));
-
-    layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { "mix", 1 }, "Mix",
-        juce::NormalisableRange<float> (0.0f, 100.0f, 1.0f), 100.0f, Attr().withLabel ("%")));
-
-    layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { "tube", 1 }, "Tube",
-        juce::NormalisableRange<float> (0.0f, 100.0f, 1.0f), 20.0f, Attr().withLabel ("%")));
-
-    // LA-2A
-    layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { "laPeak", 1 }, "Peak Reduction",
-        juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 40.0f));
-
-    layout.add (std::make_unique<juce::AudioParameterBool> (
-        juce::ParameterID { "laLimit", 1 }, "Limit", false));
-
-    // Fairchild
-    layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { "fcThresh", 1 }, "Threshold",
-        juce::NormalisableRange<float> (-40.0f, 0.0f, 0.1f), -18.0f, Attr().withLabel ("dB")));
-
-    layout.add (std::make_unique<juce::AudioParameterChoice> (
-        juce::ParameterID { "fcTime", 1 }, "Time Constant",
+        juce::ParameterID { "fcTime", 1 }, "670 Time Constant",
         juce::StringArray { "1", "2", "3", "4", "5", "6" }, 1));
+    addFloat ("fcOut",    "670 Output",     NR (-12.0f, 24.0f, 0.1f), 0.0f,   "dB");
 
     return layout;
 }
 
 void ConePressorProcessor::prepareToPlay (double sampleRate, int)
 {
-    sr = sampleRate;
-    grState = 0.0f;
-    grMemory = 0.0f;
+    la.prepare (sampleRate);
+    fc.prepare (sampleRate);
 }
 
 bool ConePressorProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -118,80 +74,58 @@ void ConePressorProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
         buffer.clear (c, 0, n);
     if (nCh == 0) return;
 
-    const int   mode     = (int) apvts.getRawParameterValue ("mode")->load();
-    const float inG      = dbToLin (apvts.getRawParameterValue ("in")->load());
-    const float outG     = dbToLin (apvts.getRawParameterValue ("out")->load());
-    const float mix      = apvts.getRawParameterValue ("mix")->load() * 0.01f;
-    const float tube     = apvts.getRawParameterValue ("tube")->load() * 0.01f;
-    const float laPeak   = apvts.getRawParameterValue ("laPeak")->load();
-    const bool  laLimit  = apvts.getRawParameterValue ("laLimit")->load() > 0.5f;
-    const float fcThresh = apvts.getRawParameterValue ("fcThresh")->load();
-    const int   fcTime   = (int) apvts.getRawParameterValue ("fcTime")->load();
+    auto get = [this] (const char* id) { return apvts.getRawParameterValue (id)->load(); };
 
-    auto coef = [this] (float ms) { return std::exp (-1.0f / (float) (sr * (double) ms * 0.001)); };
+    const float inG  = cp::dbToLin (get ("in"));
+    const float outG = cp::dbToLin (get ("out"));
+    const float mix  = get ("mix") * 0.01f;
+    const float tube = get ("tube") * 0.01f;
+    const bool  fcFirst = get ("order") > 0.5f;
 
-    // LA-2A: Peak Reduction verschiebt die Schwelle, Compress/Limit ändert Ratio + Knie
-    const float laThresh = -4.0f - laPeak * 0.4f;
-    const float laRatio  = laLimit ? 12.0f : 3.0f;
-    const float laKnee   = laLimit ? 6.0f  : 10.0f;
-    const float laAtk    = coef (10.0f);
+    const bool laOn = get ("laOn") > 0.5f;
+    const bool fcOn = get ("fcOn") > 0.5f;
 
-    // Fairchild-Zeitkonstanten 1-6 (Attack ms, Release-Bereich ms, programmabhängig ja/nein)
-    static const float fcAtkMs[6]  = { 0.2f, 0.2f, 0.2f, 0.4f, 0.8f, 0.4f };
-    static const float fcRelLo[6]  = { 300.0f, 800.0f, 2000.0f, 5000.0f, 2000.0f, 300.0f };
-    static const float fcRelHi[6]  = { 300.0f, 800.0f, 2000.0f, 5000.0f, 10000.0f, 25000.0f };
-    const int   tc     = juce::jlimit (0, 5, fcTime);
-    const float fcAtk  = coef (fcAtkMs[tc]);
+    la.setParams (get ("laPeak"), get ("laLimit") > 0.5f, get ("laGain"));
+    fc.setParams (get ("fcIn"), get ("fcThresh"), (int) get ("fcTime"), get ("fcOut"));
 
-    const float memCoef = 1.0f - coef (3000.0f);
+    if (! laOn) la.reset();
+    if (! fcOn) fc.reset();
 
-    float* data[2] = { buffer.getWritePointer (0), nCh > 1 ? buffer.getWritePointer (1) : nullptr };
-    float maxGr = 0.0f;
+    float* d0 = buffer.getWritePointer (0);
+    float* d1 = nCh > 1 ? buffer.getWritePointer (1) : nullptr;
+
+    float maxLa = 0.0f, maxFc = 0.0f;
 
     for (int i = 0; i < n; ++i)
     {
-        float x[2] = { 0.0f, 0.0f };
-        float peak = 0.0f;
-        for (int c = 0; c < nCh; ++c)
+        float l = d0[i] * inG;
+        float r = d1 != nullptr ? d1[i] * inG : l;
+        const float dryL = l, dryR = r;
+
+        if (fcFirst)
         {
-            x[c] = data[c][i] * inG;
-            peak = std::max (peak, std::abs (x[c]));          // gelinkter Detektor
-        }
-
-        const float lvlDb  = 20.0f * std::log10 (std::max (peak, 1.0e-6f));
-        const float target = (mode == 0) ? softKneeGR (lvlDb, laThresh, laRatio, laKnee)
-                                         : fairchildGR (lvlDb, fcThresh);
-
-        grMemory += (target - grMemory) * memCoef;
-
-        if (target > grState)
-        {
-            const float a = (mode == 0) ? laAtk : fcAtk;
-            grState = a * grState + (1.0f - a) * target;
+            if (fcOn) fc.process (l, r);
+            if (laOn) la.process (l, r);
         }
         else
         {
-            float relMs;
-            if (mode == 0)
-                relMs = 60.0f + (2500.0f - 60.0f) * juce::jlimit (0.0f, 1.0f, grMemory / 10.0f);
-            else
-                relMs = fcRelLo[tc] + (fcRelHi[tc] - fcRelLo[tc]) * juce::jlimit (0.0f, 1.0f, grMemory / 8.0f);
-
-            const float r = coef (relMs);
-            grState = r * grState + (1.0f - r) * target;
+            if (laOn) la.process (l, r);
+            if (fcOn) fc.process (l, r);
         }
 
-        const float g = dbToLin (-grState);
-        for (int c = 0; c < nCh; ++c)
-        {
-            const float wet = saturate (x[c] * g, tube);
-            data[c][i] = (x[c] * (1.0f - mix) + wet * mix) * outG;
-        }
+        l = cp::saturate (l, tube);
+        r = cp::saturate (r, tube);
 
-        maxGr = std::max (maxGr, grState);
+        d0[i] = (dryL * (1.0f - mix) + l * mix) * outG;
+        if (d1 != nullptr)
+            d1[i] = (dryR * (1.0f - mix) + r * mix) * outG;
+
+        maxLa = std::max (maxLa, la.gr);
+        maxFc = std::max (maxFc, fc.gr);
     }
 
-    grMeterDb.store (maxGr);
+    grLaDb.store (maxLa);
+    grFcDb.store (maxFc);
 }
 
 juce::AudioProcessorEditor* ConePressorProcessor::createEditor()
@@ -199,17 +133,109 @@ juce::AudioProcessorEditor* ConePressorProcessor::createEditor()
     return new ConePressorEditor (*this);
 }
 
+ConePressorProcessor::Snapshot ConePressorProcessor::captureSnapshot() const
+{
+    Snapshot s;
+    for (auto* p : getParameters())
+        if (auto* pid = dynamic_cast<juce::AudioProcessorParameterWithID*> (p))
+            s[pid->paramID] = pid->getValue();
+    return s;
+}
+
+void ConePressorProcessor::applySnapshot (const Snapshot& s)
+{
+    undoManager.beginNewTransaction ("A/B");
+
+    for (auto* p : getParameters())
+    {
+        auto* pid = dynamic_cast<juce::AudioProcessorParameterWithID*> (p);
+        if (pid == nullptr) continue;
+
+        const auto it = s.find (pid->paramID);
+        if (it == s.end()) continue;
+        if (std::abs (pid->getValue() - it->second) < 1.0e-6f) continue;
+
+        pid->beginChangeGesture();
+        pid->setValueNotifyingHost (it->second);
+        pid->endChangeGesture();
+    }
+}
+
+void ConePressorProcessor::switchToSlot (int slot)
+{
+    slot = juce::jlimit (0, 1, slot);
+    Snapshot target;
+    {
+        const juce::ScopedLock sl (slotLock);
+        const int cur = activeSlot.load();
+        if (slot == cur) return;
+
+        slots[(size_t) cur] = captureSnapshot();
+        if (slots[(size_t) slot].empty())
+            slots[(size_t) slot] = slots[(size_t) cur];   // erster Wechsel: B startet als Kopie von A
+
+        activeSlot.store (slot);
+        target = slots[(size_t) slot];
+    }
+    applySnapshot (target);
+}
+
+void ConePressorProcessor::copyActiveToOther()
+{
+    const juce::ScopedLock sl (slotLock);
+    const int cur = activeSlot.load();
+    slots[(size_t) (1 - cur)] = captureSnapshot();
+}
+
 void ConePressorProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
+    juce::XmlElement root ("ConePressorSession");
+    {
+        const juce::ScopedLock sl (slotLock);
+        slots[(size_t) activeSlot.load()] = captureSnapshot();
+        root.setAttribute ("active", activeSlot.load());
+
+        for (int i = 0; i < 2; ++i)
+        {
+            auto* e = root.createNewChildElement (i == 0 ? "SlotA" : "SlotB");
+            for (const auto& kv : slots[(size_t) i])
+                e->setAttribute (kv.first, (double) kv.second);
+        }
+    }
+
     if (auto xml = apvts.copyState().createXml())
-        copyXmlToBinary (*xml, destData);
+        root.addChildElement (xml.release());
+
+    copyXmlToBinary (root, destData);
 }
 
 void ConePressorProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    if (auto xml = getXmlFromBinary (data, sizeInBytes))
-        if (xml->hasTagName (apvts.state.getType()))
-            apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    auto xml = getXmlFromBinary (data, sizeInBytes);
+    if (xml == nullptr) return;
+
+    if (xml->hasTagName ("ConePressorSession"))
+    {
+        if (auto* st = xml->getChildByName (apvts.state.getType().toString()))
+            apvts.replaceState (juce::ValueTree::fromXml (*st));
+
+        const juce::ScopedLock sl (slotLock);
+        for (int i = 0; i < 2; ++i)
+        {
+            slots[(size_t) i].clear();
+            if (auto* e = xml->getChildByName (i == 0 ? "SlotA" : "SlotB"))
+                for (int a = 0; a < e->getNumAttributes(); ++a)
+                {
+                    const auto name = e->getAttributeName (a);
+                    slots[(size_t) i][name] = (float) e->getDoubleAttribute (name);
+                }
+        }
+        activeSlot.store (juce::jlimit (0, 1, xml->getIntAttribute ("active", 0)));
+    }
+    else if (xml->hasTagName (apvts.state.getType()))
+    {
+        apvts.replaceState (juce::ValueTree::fromXml (*xml));   // alter Projektstand ohne A/B
+    }
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
